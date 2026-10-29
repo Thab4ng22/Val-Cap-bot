@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+websockets
+MetaTrader5
+requests
+pydantic
