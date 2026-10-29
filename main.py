@@ -12,9 +12,8 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-app = FastAPI(title="MT5 Multi-Account Breakout Engine")
+app = FastAPI(title="Local MT5 Multi-Account Orchestrator")
 
-# Enable CORS for GitHub Pages / Local Frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,10 +22,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration & State Storage
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
+# Database storing accounts connected via the HTML page
 ACCOUNTS_DB: Dict[int, dict] = {}
 active_connections: List[WebSocket] = []
 
@@ -46,57 +45,38 @@ def send_telegram_alert(msg: str):
     except Exception as e:
         logging.error(f"Telegram error: {e}")
 
-def switch_account_session(login: int, password: str, server: str) -> bool:
-    if not mt5.initialize():
-        return False
-    return mt5.login(login=login, password=password, server=server)
-
-def get_market_telemetry(symbol: str = "XAUUSD"):
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 60)
-    if rates is None or len(rates) < 20:
-        return None
-
-    candles = [{
-        "time": datetime.fromtimestamp(r['time']).isoformat(),
-        "open": float(r['open']),
-        "high": float(r['high']),
-        "low": float(r['low']),
-        "close": float(r['close']),
-        "volume": int(r['tick_volume'])
-    } for r in rates]
-
-    latest = rates[-1]
-    close = float(latest['close'])
-    lookback = rates[-35:-5]
-    res = max(r['high'] for r in lookback)
-    supp = min(r['low'] for r in lookback)
-    sma_vol = sum(r['tick_volume'] for r in rates[-20:]) / 20.0
-
-    signal = "HOLD"
-    if close > res: signal = "BUY"
-    elif close < supp: signal = "SELL"
-
-    score = 0
-    if signal != "HOLD":
-        vol_score = 35 if (latest['tick_volume'] / sma_vol) >= 1.5 else 18
-        score = vol_score + 25 + 25 + 15
-
-    return {
-        "symbol": symbol,
-        "currentPrice": close,
-        "resistance": res,
-        "support": supp,
-        "signal": signal,
-        "score": score,
-        "candles": candles
-    }
-
 @app.post("/api/accounts/add")
 def add_account(acc: AccountRegistration):
-    if switch_account_session(acc.login, acc.password, acc.server):
+    """Dynamically logs into an MT5 account when submitted from the HTML UI."""
+    if not mt5.initialize():
+        return {"status": "ERROR", "message": "MT5 terminal failed to initialize."}
+    
+    authorized = mt5.login(login=acc.login, password=acc.password, server=acc.server)
+    if authorized:
         ACCOUNTS_DB[acc.login] = acc.dict()
-        return {"status": "SUCCESS", "message": f"Account #{acc.login} connected."}
-    return {"status": "ERROR", "message": "Authentication failed."}
+        logging.info(f"Successfully connected account #{acc.login} on server {acc.server}")
+        return {"status": "SUCCESS", "message": f"Account #{acc.login} connected successfully!"}
+    else:
+        err = mt5.last_error()
+        return {"status": "ERROR", "message": f"Authentication failed. MT5 Error: {err}"}
+
+@app.get("/api/accounts/list")
+def list_accounts():
+    """Returns telemetry (balance, equity, profit) for all connected accounts."""
+    telemetry = []
+    for login, creds in ACCOUNTS_DB.items():
+        if mt5.login(login=creds["login"], password=creds["password"], server=creds["server"]):
+            acc_info = mt5.account_info()
+            if acc_info:
+                telemetry.append({
+                    "login": creds["login"],
+                    "server": creds["server"],
+                    "balance": acc_info.balance,
+                    "equity": acc_info.equity,
+                    "profit": acc_info.profit,
+                    "active_pairs": creds["active_pairs"]
+                })
+    return telemetry
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -104,11 +84,51 @@ async def websocket_endpoint(websocket: WebSocket):
     active_connections.append(websocket)
     try:
         while True:
-            if switch_account_session(list(ACCOUNTS_DB.values())[0]["login"], list(ACCOUNTS_DB.values())[0]["password"], list(ACCOUNTS_DB.values())[0]["server"]) if ACCOUNTS_DB else mt5.initialize():
-                data = get_market_telemetry("XAUUSD")
-                if data:
-                    data["type"] = "MARKET_UPDATE"
-                    await websocket.send_text(json.dumps(data))
+            market_data = {}
+            if ACCOUNTS_DB:
+                # Use the first active account session to fetch live market chart data
+                first_acc = list(ACCOUNTS_DB.values())[0]
+                if mt5.login(login=first_acc["login"], password=first_acc["password"], server=first_acc["server"]):
+                    rates = mt5.copy_rates_from_pos("XAUUSD", mt5.TIMEFRAME_M15, 0, 60)
+                    if rates is not None and len(rates) >= 20:
+                        candles = [{
+                            "time": datetime.fromtimestamp(r['time']).isoformat(),
+                            "open": float(r['open']),
+                            "high": float(r['high']),
+                            "low": float(r['low']),
+                            "close": float(r['close']),
+                            "volume": int(r['tick_volume'])
+                        } for r in rates]
+
+                        latest = rates[-1]
+                        close = float(latest['close'])
+                        lookback = rates[-35:-5]
+                        res = max(r['high'] for r in lookback)
+                        supp = min(r['low'] for r in lookback)
+                        sma_vol = sum(r['tick_volume'] for r in rates[-20:]) / 20.0
+
+                        signal = "HOLD"
+                        if close > res: signal = "BUY"
+                        elif close < supp: signal = "SELL"
+
+                        score = 0
+                        if signal != "HOLD":
+                            vol_score = 35 if (latest['tick_volume'] / sma_vol) >= 1.5 else 18
+                            score = vol_score + 25 + 25 + 15
+
+                        market_data = {
+                            "type": "MARKET_UPDATE",
+                            "symbol": "XAUUSD",
+                            "currentPrice": close,
+                            "resistance": res,
+                            "support": supp,
+                            "signal": signal,
+                            "score": score,
+                            "candles": candles
+                        }
+
+            if market_data:
+                await websocket.send_text(json.dumps(market_data))
             await asyncio.sleep(1.5)
     except WebSocketDisconnect:
         active_connections.remove(websocket)
