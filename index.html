@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MT5 Multi-Account Breakout Terminal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-[#0a0d12] text-gray-200 font-sans min-h-screen flex flex-col">
+
+    <header class="border-b border-[#1f293d] bg-[#121824]/80 px-4 py-3 flex justify-between items-center">
+        <h1 class="text-sm font-bold text-white flex items-center gap-2">
+            <i class="fa-solid fa-chart-line text-blue-500"></i> MT5 LIVE ORCHESTRATOR TERMINAL
+        </h1>
+        <div id="connectionStatus" class="text-xs font-mono px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
+            Connecting to Local MT5 Bridge...
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto w-full p-4 grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1">
+        <div class="lg:col-span-8 bg-[#121824] border border-[#1f293d] rounded-xl p-4 flex flex-col">
+            <div class="flex justify-between items-center pb-3 mb-3 border-b border-[#1f293d] text-sm">
+                <span id="symbolDisplay" class="font-mono font-bold text-white">XAUUSD</span>
+                <span class="text-gray-400">Live Price: <strong id="priceDisplay" class="text-emerald-400">$0.00</strong></span>
+            </div>
+            <div class="relative w-full h-[380px] bg-[#0a0d12] rounded border border-[#1f293d]/60 flex items-center justify-center">
+                <canvas id="chartCanvas" class="w-full h-full"></canvas>
+            </div>
+        </div>
+
+        <div class="lg:col-span-4 bg-[#121824] border border-[#1f293d] rounded-xl p-5 flex flex-col gap-4">
+            <h3 class="text-xs font-bold uppercase text-gray-400">Signal & Confluence</h3>
+            <div id="signalBox" class="p-4 bg-[#0a0d12] rounded-xl border border-[#1f293d] text-center">
+                <div id="signalBadge" class="text-xl font-black text-gray-500">WAITING FOR DATA</div>
+                <div id="scoreDisplay" class="text-xs font-mono text-gray-400 mt-1">Confluence Score: 0%</div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const canvas = document.getElementById('chartCanvas');
+        const ctx = canvas.getContext('2d');
+        let chartCandles = [];
+
+        function connectWS() {
+            const ws = new WebSocket('ws://localhost:8000/ws');
+            ws.onopen = () => {
+                document.getElementById('connectionStatus').innerText = 'Connected to MT5';
+                document.getElementById('connectionStatus').className = 'text-xs font-mono px-2 py-1 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+            };
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'MARKET_UPDATE') {
+                    document.getElementById('priceDisplay').innerText = '$' + data.currentPrice.toFixed(2);
+                    document.getElementById('symbolDisplay').innerText = data.symbol;
+                    document.getElementById('scoreDisplay').innerText = 'Confluence Score: ' + data.score + '%';
+                    
+                    const badge = document.getElementById('signalBadge');
+                    badge.innerText = data.signal;
+                    badge.className = data.signal === 'BUY' ? 'text-xl font-black text-emerald-400' : (data.signal === 'SELL' ? 'text-xl font-black text-red-400' : 'text-xl font-black text-gray-500');
+
+                    chartCandles = data.candles;
+                    renderChart(data.resistance, data.support);
+                }
+            };
+            ws.onclose = () => {
+                document.getElementById('connectionStatus').innerText = 'Disconnected (Retrying...)';
+                document.getElementById('connectionStatus').className = 'text-xs font-mono px-2 py-1 rounded bg-red-500/20 text-red-400 border border-red-500/30';
+                setTimeout(connectWS, 3000);
+            };
+        }
+
+        function renderChart(res, supp) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (!chartCandles.length) return;
+
+            canvas.width = canvas.parentElement.clientWidth;
+            canvas.height = canvas.parentElement.clientHeight;
+
+            let min = Math.min(...chartCandles.map(c => c.low));
+            let max = Math.max(...chartCandles.map(c => c.high));
+            const range = max - min || 1;
+            const w = canvas.width / chartCandles.length;
+
+            chartCandles.forEach((c, i) => {
+                const x = i * w + w / 2;
+                const openY = canvas.height - ((c.open - min) / range) * canvas.height;
+                const closeY = canvas.height - ((c.close - min) / range) * canvas.height;
+                const highY = canvas.height - ((c.high - min) / range) * canvas.height;
+                const lowY = canvas.height - ((c.low - min) / range) * canvas.height;
+
+                ctx.strokeStyle = c.close >= c.open ? '#10b981' : '#ef4444';
+                ctx.beginPath(); ctx.moveTo(x, highY); ctx.lineTo(x, lowY); ctx.stroke();
+                ctx.fillStyle = ctx.strokeStyle;
+                ctx.fillRect(x - w * 0.3, Math.min(openY, closeY), w * 0.6, Math.max(Math.abs(closeY - openY), 1));
+            });
+        }
+
+        window.addEventListener('DOMContentLoaded', connectWS);
+    </script>
+</body>
+</html>
